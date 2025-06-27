@@ -7,16 +7,19 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/hashicorp/go-azure-helpers/resourcemanager/commonids"
 	"github.com/hashicorp/go-azure-sdk/resource-manager/compute/2022-03-01/images"
 	"github.com/hashicorp/go-azure-sdk/resource-manager/compute/2022-03-01/virtualmachines"
 	"github.com/hashicorp/packer-plugin-azure/builder/azure/common/client"
 	"github.com/hashicorp/packer-plugin-azure/builder/azure/common/constants"
 	"github.com/hashicorp/packer-plugin-sdk/multistep"
 	packersdk "github.com/hashicorp/packer-plugin-sdk/packer"
+	"github.com/tianyiliumsft/go-azure-sdk/resource-manager/compute/2022-03-02/disks"
 )
 
 type StepCaptureImage struct {
 	client              *AzureClient
+	config              *Config
 	generalizeVM        func(ctx context.Context, vmId virtualmachines.VirtualMachineId) error
 	getVMInternalID     func(ctx context.Context, vmId virtualmachines.VirtualMachineId) (string, error)
 	captureVhd          func(ctx context.Context, vmId virtualmachines.VirtualMachineId, parameters *virtualmachines.VirtualMachineCaptureParameters) error
@@ -25,8 +28,9 @@ type StepCaptureImage struct {
 	error               func(e error)
 }
 
-func NewStepCaptureImage(client *AzureClient, ui packersdk.Ui) *StepCaptureImage {
+func NewStepCaptureImage(client *AzureClient, ui packersdk.Ui, config *Config) *StepCaptureImage {
 	var step = &StepCaptureImage{
+		config: config,
 		client: client,
 		say: func(message string) {
 			ui.Say(message)
@@ -88,12 +92,33 @@ func (s *StepCaptureImage) getVMID(ctx context.Context, vmId virtualmachines.Vir
 	return "", client.NullModelSDKErr
 }
 
+func (s *StepCaptureImage) grantAccess(cxt context.Context, subscriptionId string, resourceGroupName string, osDiskName string) (string, error) {
+	pollingContext, cancel := context.WithTimeout(cxt, s.client.PollingDuration)
+	defer cancel()
+	diskID := commonids.NewManagedDiskID(subscriptionId, resourceGroupName, osDiskName)
+
+	grantAccessData := disks.GrantAccessData{
+		Access:            disks.AccessLevelRead,
+		DurationInSeconds: 60,
+	}
+	result, err := s.client.DisksClient.GrantAccessThenPoll(pollingContext, diskID, grantAccessData)
+	if err != nil {
+		return "", err
+	}
+
+	s.say(fmt.Sprintf(" -> accessUri                : '%s'", *result.AccessSAS))
+	if result.AccessSAS != nil {
+		return *result.AccessSAS, nil
+	}
+	return "", client.NullModelSDKErr
+}
+
 func (s *StepCaptureImage) Run(ctx context.Context, state multistep.StateBag) multistep.StepAction {
 
 	var computeName = state.Get(constants.ArmComputeName).(string)
 	var location = state.Get(constants.ArmLocation).(string)
 	var resourceGroupName = state.Get(constants.ArmResourceGroupName).(string)
-	var vmCaptureParameters = state.Get(constants.ArmVirtualMachineCaptureParameters).(*virtualmachines.VirtualMachineCaptureParameters)
+	//var vmCaptureParameters = state.Get(constants.ArmVirtualMachineCaptureParameters).(*virtualmachines.VirtualMachineCaptureParameters)
 	var imageParameters = state.Get(constants.ArmImageParameters).(*images.Image)
 	var subscriptionId = state.Get(constants.ArmSubscription).(string)
 	var isManagedImage = state.Get(constants.ArmIsManagedImage).(bool)
@@ -148,12 +173,32 @@ func (s *StepCaptureImage) Run(ctx context.Context, state multistep.StateBag) mu
 			s.say(fmt.Sprintf(" -> VM Internal ID            : '%s'", vmInternalID))
 			state.Put(constants.ArmBuildVMInternalId, vmInternalID)
 			s.say("Capturing VHD ...")
-			err = s.captureVhd(ctx, vmId, vmCaptureParameters)
+
+			var osDiskName = s.config.tmpOSDiskName
+			s.say(fmt.Sprintf(" -> osDiskName                : '%s'", osDiskName))
+
+			accessUri, err := s.grantAccess(ctx, subscriptionId, resourceGroupName, osDiskName)
 			if err != nil {
+				err = fmt.Errorf("Failed to grant access to OS disk with err : %s", err)
 				state.Put(constants.Error, err)
 				s.error(err)
 				return multistep.ActionHalt
 			}
+
+			s.say(fmt.Sprintf(" -> accessUri                : '%s'", accessUri))
+			//vmCaptureParametersJson, err := json.MarshalIndent(vmCaptureParameters, "", "  ")
+			//if err != nil {
+			//	s.say(err.Error())
+			//} else {
+			//	s.say(string(vmCaptureParametersJson))
+			//}
+
+			//err = s.captureVhd(ctx, vmId, vmCaptureParameters)
+			//if err != nil {
+			//	state.Put(constants.Error, err)
+			//	s.error(err)
+			//	return multistep.ActionHalt
+			//}
 		}
 	}
 	return multistep.ActionContinue
